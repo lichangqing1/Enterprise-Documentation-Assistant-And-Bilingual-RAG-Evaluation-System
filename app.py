@@ -15,14 +15,26 @@ from src.document_manager import (
     list_enterprise_documents,
     reindex_enterprise_documents,
 )
+from src.enterprise_assistant import (
+    EnterpriseAssistantUnavailableError,
+    ask_enterprise_question,
+    enterprise_reindex_reason,
+)
+from src.grounded_llm import (
+    GroundedLLMProviderError,
+    GroundedLLMResponseError,
+    LLMConfigurationError,
+    ask_grounded_llm_question,
+    get_llm_provider_status,
+)
 from src.text_splitter import create_chunks
 from src.retrieval import build_vector_store
 from src.rag_pipeline import SimpleRAGPipeline
 
 
-st.set_page_config(page_title="Customer Support RAG Assistant", layout="wide")
-st.title("AI Customer Support RAG Assistant")
-st.caption("RAG chatbot with source-grounded answers and evaluation-focused design.")
+st.set_page_config(page_title="Enterprise Documentation Assistant", layout="wide")
+st.title("Enterprise Documentation Assistant")
+st.caption("Grounded document Q&A with a preserved customer-support evaluation baseline.")
 
 DOCUMENT_DIR = PROJECT_PATH / "data" / "documents"
 
@@ -41,8 +53,18 @@ def load_rag_pipeline(chunk_size: int, overlap: int, top_k: int, retrieval_mode:
     return rag, docs, chunks
 
 
+st.session_state.setdefault("enterprise_document_index", None)
+
 with st.sidebar:
-    st.header("RAG Settings")
+    st.header("Assistant mode")
+    assistant_mode = st.segmented_control(
+        "Q&A collection",
+        ["Legacy customer support", "Enterprise documentation"],
+        default="Legacy customer support",
+        required=True,
+    )
+
+    st.header("RAG settings")
     chunk_size = st.slider("Chunk size", min_value=200, max_value=1000, value=500, step=100)
     overlap = st.slider("Overlap", min_value=0, max_value=300, value=100, step=50)
     top_k = st.slider("Top-K retrieved chunks", min_value=1, max_value=5, value=3, step=1)
@@ -51,7 +73,15 @@ with st.sidebar:
     if semantic_backend == "faiss":
         st.warning("FAISS backend requires optional dependencies: pip install -r requirements-vector.txt")
 
-    st.header("Example Questions")
+if assistant_mode == "Legacy customer support":
+    rag, docs, chunks = load_rag_pipeline(chunk_size, overlap, top_k, retrieval_mode, semantic_backend)
+
+    st.subheader("Legacy customer support Q&A")
+    st.caption("This mode uses only the historical data/documents benchmark corpus.")
+    col1, col2 = st.columns(2)
+    col1.metric("Documents", len(docs))
+    col2.metric("Chunks", len(chunks))
+
     example_question = st.selectbox(
         "Choose an example",
         [
@@ -62,35 +92,128 @@ with st.sidebar:
             "Can I pay with cryptocurrency?",
         ],
     )
+    question = st.text_input(
+        "Ask a customer support question",
+        value=example_question,
+        key="legacy_question",
+    )
 
-rag, docs, chunks = load_rag_pipeline(chunk_size, overlap, top_k, retrieval_mode, semantic_backend)
+    if st.button("Ask legacy collection") and question.strip():
+        response = rag.ask(question)
 
-st.subheader("Knowledge Base Summary")
-col1, col2 = st.columns(2)
-col1.metric("Documents", len(docs))
-col2.metric("Chunks", len(chunks))
+        st.subheader("Answer")
+        st.write(response["answer"])
 
-question = st.text_input("Ask a customer support question:", value=example_question)
+        st.subheader("Retrieved sources")
+        for i, chunk in enumerate(response["retrieved_chunks"], start=1):
+            with st.expander(
+                f"Retrieved chunk {i}: {chunk['source']} | "
+                f"Score: {chunk.get('similarity_score', 0):.4f}"
+            ):
+                st.write(chunk["text"])
+else:
+    enterprise_documents = list_enterprise_documents(DEFAULT_ENTERPRISE_DOCUMENT_DIR)
+    enterprise_index = st.session_state["enterprise_document_index"]
+    reindex_reason = enterprise_reindex_reason(
+        enterprise_index,
+        DEFAULT_ENTERPRISE_DOCUMENT_DIR,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        retrieval_mode=retrieval_mode,
+        semantic_backend=semantic_backend,
+    )
 
-if st.button("Ask") and question.strip():
-    response = rag.ask(question)
+    st.subheader("Enterprise documentation Q&A")
+    st.caption("This mode searches only data/enterprise_documents. It never searches the legacy corpus.")
+    col1, col2 = st.columns(2)
+    col1.metric("Managed documents", len(enterprise_documents))
+    col2.metric("Indexed chunks", enterprise_index.chunk_count if reindex_reason is None else 0)
 
-    st.subheader("Answer")
-    st.write(response["answer"])
+    if reindex_reason is not None:
+        st.warning(reindex_reason)
+    else:
+        st.success("The enterprise index matches the current documents and retrieval settings.")
 
-    st.subheader("Retrieved Sources")
-    for i, chunk in enumerate(response["retrieved_chunks"], start=1):
-        with st.expander(f"Retrieved Chunk {i}: {chunk['source']} | Score: {chunk.get('similarity_score', 0):.4f}"):
-            st.write(chunk["text"])
+    answering_mode = st.segmented_control(
+        "Answering mode",
+        ["Extractive", "LLM grounded"],
+        default="Extractive",
+        required=True,
+        key="enterprise_answering_mode",
+        help="Both modes use the same retrieved enterprise evidence. LLM mode is optional and explicit.",
+    )
+    provider_status = get_llm_provider_status()
+    if answering_mode == "LLM grounded":
+        if provider_status.configured:
+            st.success(provider_status.message)
+            st.caption(
+                "Only retrieved enterprise evidence is sent after you click Ask. "
+                "Document instructions are treated as untrusted text, and citations are validated."
+            )
+        else:
+            st.info(provider_status.message)
+
+    enterprise_question = st.text_input(
+        "Ask about your enterprise documents",
+        placeholder="For example: How often is preventive maintenance required?",
+        key="enterprise_question",
+    )
+    ask_disabled = reindex_reason is not None or (
+        answering_mode == "LLM grounded" and not provider_status.configured
+    )
+    if st.button("Ask enterprise collection", disabled=ask_disabled):
+        try:
+            answer_function = (
+                ask_grounded_llm_question
+                if answering_mode == "LLM grounded"
+                else ask_enterprise_question
+            )
+            response = answer_function(
+                enterprise_question,
+                enterprise_index,
+                DEFAULT_ENTERPRISE_DOCUMENT_DIR,
+                top_k=top_k,
+                chunk_size=chunk_size,
+                overlap=overlap,
+                retrieval_mode=retrieval_mode,
+                semantic_backend=semantic_backend,
+            )
+            st.subheader("Answer")
+            if response["status"] == "insufficient_evidence":
+                st.info(response["answer"])
+            else:
+                st.write(response["answer"])
+            st.caption(
+                "Answering mode: "
+                + ("LLM grounded" if response["answer_mode"] == "llm_grounded" else "Extractive")
+            )
+
+            supporting_sources = response["supporting_sources"]
+            st.subheader("Supporting documents")
+            st.write(
+                ", ".join(supporting_sources)
+                if supporting_sources
+                else "No document was cited because the retrieved evidence was insufficient."
+            )
+
+            st.subheader("Retrieved evidence")
+            for i, chunk in enumerate(response["retrieved_chunks"], start=1):
+                with st.expander(
+                    f"Evidence {i}: {chunk['source']} | "
+                    f"Score: {chunk.get('similarity_score', 0):.4f}"
+                ):
+                    st.write(chunk["text"])
+        except (EnterpriseAssistantUnavailableError, ValueError) as exc:
+            st.warning(str(exc))
+        except (LLMConfigurationError, GroundedLLMProviderError, GroundedLLMResponseError) as exc:
+            st.error(str(exc))
 
 st.divider()
 st.subheader("Enterprise document management")
 st.caption(
-    "Manage a separate enterprise document collection. These files do not change "
-    "the legacy benchmark corpus or the current Q&A assistant."
+    "Manage the collection used only by Enterprise documentation Q&A. "
+    "These files never change the legacy benchmark corpus."
 )
-
-st.session_state.setdefault("enterprise_document_index", None)
 
 with st.container(border=True):
     with st.form("enterprise_document_upload", clear_on_submit=True):
@@ -111,8 +234,10 @@ with st.container(border=True):
                     uploaded_document.getvalue(),
                     DEFAULT_ENTERPRISE_DOCUMENT_DIR,
                 )
-                st.session_state["enterprise_document_index"] = None
-                st.success(f"Added {added_path.name}. Reindex the collection to include it.")
+                st.success(
+                    f"Added {added_path.name}. The enterprise collection changed; "
+                    "reindex it before asking questions."
+                )
             except DocumentValidationError as exc:
                 st.error(str(exc))
 
@@ -140,12 +265,22 @@ with st.container(border=True):
             st.error(str(exc))
 
     current_enterprise_index = st.session_state["enterprise_document_index"]
-    if current_enterprise_index is not None:
+    current_reindex_reason = enterprise_reindex_reason(
+        current_enterprise_index,
+        DEFAULT_ENTERPRISE_DOCUMENT_DIR,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        retrieval_mode=retrieval_mode,
+        semantic_backend=semantic_backend,
+    )
+    if current_reindex_reason is None:
         st.caption(
             f"Current session index: {current_enterprise_index.document_count} documents, "
             f"{current_enterprise_index.chunk_count} chunks, "
             f"{current_enterprise_index.retrieval_mode}/{current_enterprise_index.semantic_backend}."
         )
+    else:
+        st.warning(f"Reindex required: {current_reindex_reason}")
 
 st.divider()
 st.subheader("Evaluation Design")

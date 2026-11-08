@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
@@ -26,6 +27,9 @@ class EnterpriseDocumentIndex:
     vector_store: Any
     retrieval_mode: str
     semantic_backend: str
+    chunk_size: int
+    overlap: int
+    collection_fingerprint: str
 
     @property
     def document_count(self) -> int:
@@ -145,6 +149,28 @@ def list_enterprise_documents(
     ]
 
 
+def enterprise_collection_fingerprint(
+    document_dir: Union[str, Path] = DEFAULT_ENTERPRISE_DOCUMENT_DIR,
+) -> str:
+    """Return a content fingerprint for all visible files in the collection."""
+    collection_path = ensure_enterprise_collection(document_dir)
+    digest = hashlib.sha256()
+    for file_path in sorted(collection_path.iterdir()):
+        if not file_path.is_file() or file_path.name.startswith("."):
+            continue
+        try:
+            content = file_path.read_bytes()
+        except OSError as exc:
+            raise DocumentValidationError(
+                f"Could not read enterprise document '{file_path.name}': {exc}"
+            ) from exc
+        digest.update(file_path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(content)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def reindex_enterprise_documents(
     document_dir: Union[str, Path] = DEFAULT_ENTERPRISE_DOCUMENT_DIR,
     chunk_size: int = 500,
@@ -167,6 +193,7 @@ def reindex_enterprise_documents(
             "The enterprise collection is empty. Add a .md or .txt document before reindexing."
         )
 
+    fingerprint_before = enterprise_collection_fingerprint(collection_path)
     documents = load_documents(str(collection_path), extensions=SUPPORTED_EXTENSIONS)
     validate_documents(documents)
     chunks = create_chunks(documents, chunk_size=chunk_size, overlap=overlap)
@@ -178,10 +205,18 @@ def reindex_enterprise_documents(
         semantic_backend=semantic_backend,
     )
     vector_store.build_index(chunks)
+    fingerprint_after = enterprise_collection_fingerprint(collection_path)
+    if fingerprint_before != fingerprint_after:
+        raise DocumentValidationError(
+            "The enterprise collection changed during reindexing. Run reindex again."
+        )
     return EnterpriseDocumentIndex(
         documents=documents,
         chunks=chunks,
         vector_store=vector_store,
         retrieval_mode=retrieval_mode,
         semantic_backend=semantic_backend,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        collection_fingerprint=fingerprint_after,
     )

@@ -45,6 +45,8 @@ class LexicalRetriever:
         min_score = float(scores.min())
         max_score = float(scores.max())
         if max_score == min_score:
+            if max_score > 0:
+                return np.ones_like(scores, dtype=float)
             return np.zeros_like(scores, dtype=float)
         return (scores - min_score) / (max_score - min_score)
 

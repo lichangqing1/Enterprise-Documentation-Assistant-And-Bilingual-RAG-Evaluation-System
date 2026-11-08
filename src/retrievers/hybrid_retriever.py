@@ -40,7 +40,8 @@ class HybridRetriever:
         min_score = min(values)
         max_score = max(values)
         if max_score == min_score:
-            return {key: 0.0 for key in scores}
+            normalized_value = 1.0 if max_score > 0 else 0.0
+            return {key: normalized_value for key in scores}
         return {
             key: (value - min_score) / (max_score - min_score)
             for key, value in scores.items()

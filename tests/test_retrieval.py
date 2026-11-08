@@ -60,3 +60,18 @@ def test_retrieval_factory_builds_requested_modes():
     assert isinstance(build_vector_store("lexical"), LexicalRetriever)
     assert isinstance(build_vector_store("semantic"), LocalSemanticRetriever)
     assert isinstance(build_vector_store("hybrid"), HybridRetriever)
+
+
+def test_single_matching_chunk_keeps_positive_similarity_score():
+    chunks = [
+        {
+            "chunk_id": "policy.md_chunk_0",
+            "source": "policy.md",
+            "text": "Access reviews are completed every 90 days.",
+        }
+    ]
+
+    for vector_store in [LexicalRetriever(), LocalSemanticRetriever(), HybridRetriever()]:
+        vector_store.build_index(chunks)
+        result = vector_store.search("How often are access reviews completed?", top_k=1)[0]
+        assert result["similarity_score"] == 1.0

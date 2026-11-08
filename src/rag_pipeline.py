@@ -19,6 +19,11 @@ class SimpleRAGPipeline:
         "items", "policy", "business", "days", "take", "takes"
     }
 
+    GENERIC_QUESTION_TERMS = {
+        "available", "detail", "explain", "information", "long", "please",
+        "standard", "take", "tell", "usually",
+    }
+
     HIGH_SIGNAL_ABSENT_TERMS = {
         "cryptocurrency", "crypto", "bitcoin", "international", "overseas",
         "paypal", "venmo", "alipay", "wechat", "klarna", "cash", "cod"
@@ -75,12 +80,32 @@ class SimpleRAGPipeline:
         r"恶意.*上下文",
     )
 
+    TEMPORAL_QUESTION_PATTERNS = (
+        r"\bhow (?:long|often|frequently)\b",
+        r"\bwhen\b",
+        r"\b(?:response|resolution) (?:time|target)\b",
+        r"\b(?:frequency|duration|timeline|deadline)\b",
+        r"多久",
+        r"多长时间",
+        r"什么时候",
+        r"何时",
+        r"频率",
+    )
+
+    TEMPORAL_EVIDENCE_PATTERN = re.compile(
+        r"(?:\b(?:every|within|after|before|when|daily|weekly|monthly|quarterly|annually|yearly)\b"
+        r"|\b(?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten)[-\s]+"
+        r"(?:business\s+)?(?:minute|hour|day|week|month|year)s?\b"
+        r"|(?:每|在|于)?\s*\d+(?:\.\d+)?\s*(?:个)?(?:分钟|小时|工作日|自然日|天|周|月|年)(?:内|后|前|一次)?)",
+        flags=re.IGNORECASE,
+    )
+
     def __init__(
         self,
         vector_store,
         top_k: int = 3,
         min_similarity_score: float = 0.05,
-        min_question_coverage: float = 0.08,
+        min_question_coverage: float = 0.30,
     ):
         self.vector_store = vector_store
         self.top_k = top_k
@@ -93,9 +118,65 @@ class SimpleRAGPipeline:
 
     @staticmethod
     def _split_sentences(text: str) -> List[str]:
-        """Simple sentence splitter."""
-        sentences = re.split(r"(?<=[.!?。！？])\s*", text.strip())
-        return [sentence.strip() for sentence in sentences if sentence.strip()]
+        """Split prose and Markdown lists without attaching heading text."""
+        blocks = []
+        paragraph_lines = []
+
+        def flush_paragraph() -> None:
+            if paragraph_lines:
+                blocks.append(" ".join(paragraph_lines))
+                paragraph_lines.clear()
+
+        for raw_line in text.strip().splitlines():
+            line = raw_line.strip()
+            if not line:
+                flush_paragraph()
+                continue
+            if re.match(r"^#{1,6}\s+", line):
+                flush_paragraph()
+                continue
+            list_item = re.match(r"^(?:[-*+] |\d+[.)]\s+)(.+)$", line)
+            if list_item:
+                flush_paragraph()
+                blocks.append(list_item.group(1).strip())
+                continue
+            paragraph_lines.append(line)
+        flush_paragraph()
+
+        sentences = []
+        for block in blocks:
+            sentences.extend(re.split(r"(?<=[.!?。！？])\s*", block))
+        return [
+            re.sub(r"[*_`~]", "", sentence).strip()
+            for sentence in sentences
+            if sentence.strip()
+        ]
+
+    @staticmethod
+    def _sentence_identity(sentence: str) -> str:
+        """Return a stable key for duplicate sentences from overlapping chunks."""
+        without_markdown = re.sub(r"[*_`~]", "", sentence)
+        return re.sub(r"\s+", " ", without_markdown).strip().lower()
+
+    @staticmethod
+    def _permission_polarity(text: str) -> str:
+        """Identify explicit permission polarity for extractive sentence filtering."""
+        negative = (
+            r"\bnot\s+(?:allowed|permitted|authorized)\b",
+            r"\b(?:must|may|can|could|should)\s+not\b",
+            r"\b(?:cannot|can't|prohibited|forbidden|disallowed)\b",
+            r"(?:不允许|禁止|不得|不能|不可|不可以|未获准|无权)",
+        )
+        positive = (
+            r"\b(?:allowed|permitted|authorized)\b",
+            r"\bmay\b",
+            r"(?:允许|可以|获准|有权)",
+        )
+        if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in negative):
+            return "negative"
+        if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in positive):
+            return "positive"
+        return "neutral"
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:
@@ -131,6 +212,15 @@ class SimpleRAGPipeline:
     def _normalize_token(cls, token: str) -> str:
         """Very small normalization helper for rule-based matching."""
         token = token.lower().strip()
+        non_adverb_ly_words = {
+            "apply", "assembly", "costly", "daily", "early", "family",
+            "friendly", "likely", "lively", "lovely", "monthly", "only",
+            "reply", "supply", "weekly", "yearly",
+        }
+        if token.endswith("ily") and len(token) > 6 and token not in non_adverb_ly_words:
+            return token[:-3] + "y"
+        if token.endswith("ly") and len(token) > 5 and token not in non_adverb_ly_words:
+            return token[:-2]
         if token.endswith("ied") and len(token) > 4:
             return token[:-3] + "y"
         if token.endswith("ged") and len(token) > 4:
@@ -148,6 +238,92 @@ class SimpleRAGPipeline:
     @classmethod
     def _normalized_word_set(cls, text: str) -> Set[str]:
         return {cls._normalize_token(token) for token in cls._important_words(text)}
+
+    @classmethod
+    def _evidence_terms(cls, text: str) -> Set[str]:
+        """Return comparable evidence concepts for English or Chinese text."""
+        # Inline Markdown is presentation syntax, not a concept boundary. This
+        # matters for Chinese text such as 员工**可以**, where the markers would
+        # otherwise break subject/action bigrams used for relevance ranking.
+        text = re.sub(r"[*_`~]", "", text)
+        if cls._contains_chinese(text):
+            # Chinese has no whitespace word boundaries. The general tokenizer
+            # emits a full phrase plus bigrams and trigrams, which inflates the
+            # denominator and makes a supported paraphrase look unrelated.
+            # Use stable two-character concepts for evidence coverage while
+            # retaining ASCII terms such as product names or numbers.
+            chinese_bigrams = {
+                sequence[index:index + 2]
+                for sequence in re.findall(r"[\u4e00-\u9fff]{2,}", text)
+                for index in range(len(sequence) - 1)
+            }
+            ascii_terms = {
+                cls._normalize_token(token)
+                for token in re.findall(r"[a-zA-Z0-9$]+", text.lower())
+                if len(token) > 2
+            }
+            return chinese_bigrams | ascii_terms
+        return cls._normalized_word_set(text)
+
+    @classmethod
+    def _evidence_question_terms(cls, question: str) -> Set[str]:
+        """Return question concepts that retrieved evidence must actually support."""
+        question_for_matching = question
+        if cls._is_broad_policy_question(question):
+            if cls._contains_chinese(question):
+                question_for_matching = re.sub(
+                    r"(?:哪些|什么|适用|安全|要求|政策|规定|规则|控制|限制|权限|标准|指南|概述|总结)",
+                    "",
+                    question,
+                )
+            else:
+                question_for_matching = re.sub(
+                    r"\b(?:security|requirements?|apply|applies|applicable|polic(?:y|ies)|"
+                    r"rules?|controls?|guidelines?|restrictions?|permissions?|standards?|summary)\b",
+                    " ",
+                    question,
+                    flags=re.IGNORECASE,
+                )
+        normalized_generic_terms = {
+            cls._normalize_token(term)
+            for term in cls.GENERIC_QUESTION_TERMS
+        }
+        return cls._evidence_terms(question_for_matching) - normalized_generic_terms
+
+    @staticmethod
+    def _is_broad_policy_question(question: str) -> bool:
+        """Identify questions asking for a policy-level summary or requirements."""
+        return bool(re.search(
+            r"\b(?:requirements?|polic(?:y|ies)|rules?|controls?|guidelines?|"
+            r"restrictions?|permissions?|standards?|summary)\b|"
+            r"(?:要求|政策|规定|规则|控制|限制|权限|标准|指南|概述|总结)",
+            question,
+            flags=re.IGNORECASE,
+        ))
+
+    @classmethod
+    def _question_subject_terms(cls, question: str) -> Set[str]:
+        """Extract a narrow subject anchor for permission-style questions."""
+        if cls._contains_chinese(question):
+            match = re.match(r"^(.+?)(?:可以|能否|是否|能不能|会不会)", question.strip())
+            return cls._evidence_terms(match.group(1)) if match else set()
+
+        question_lower = question.lower().strip()
+        auxiliary_match = re.match(
+            r"^(?:are|is|can|could|do|does|will|would|should)\s+(.+?)\s+"
+            r"(?:allowed|permitted|authorized|be|access)\b",
+            question_lower,
+        )
+        if auxiliary_match:
+            return cls._evidence_terms(auxiliary_match.group(1))
+        if (
+            re.search(r"\b(?:allowed|permitted|authorized|access)\b", question_lower)
+            or cls._is_broad_policy_question(question)
+        ):
+            trailing_match = re.search(r"\bfor\s+([a-z][a-z\s-]{0,40})\??$", question_lower)
+            if trailing_match:
+                return cls._evidence_terms(trailing_match.group(1))
+        return set()
 
     @staticmethod
     def _numeric_terms(text: str) -> Set[str]:
@@ -187,13 +363,24 @@ class SimpleRAGPipeline:
         return any(re.search(pattern, question_norm) for pattern in cls.PROMPT_INJECTION_PATTERNS)
 
     @classmethod
+    def _expects_temporal_answer(cls, question: str) -> bool:
+        return any(
+            re.search(pattern, question, flags=re.IGNORECASE)
+            for pattern in cls.TEMPORAL_QUESTION_PATTERNS
+        )
+
+    @classmethod
+    def _contains_temporal_evidence(cls, text: str) -> bool:
+        return bool(cls.TEMPORAL_EVIDENCE_PATTERN.search(text))
+
+    @classmethod
     def _missing_context_terms(
         cls,
         question: str,
         retrieved_chunks: List[Dict[str, object]],
     ) -> Tuple[Set[str], float]:
-        question_terms = {cls._normalize_token(term) for term in cls._important_words(question)}
-        context_terms = cls._normalized_word_set(cls._context_text(retrieved_chunks))
+        question_terms = cls._evidence_question_terms(question)
+        context_terms = cls._evidence_terms(cls._context_text(retrieved_chunks))
         if not question_terms:
             return set(), 1.0
         covered_terms = question_terms.intersection(context_terms)
@@ -342,18 +529,34 @@ class SimpleRAGPipeline:
         if best_score < self.min_similarity_score:
             return self._safe_no_answer("retrieval similarity below threshold")
 
-        question_words = self._normalized_word_set(question)
+        question_words = self._evidence_question_terms(question)
+        question_subject_terms = self._question_subject_terms(question)
+        broad_policy_summary = (
+            self._is_broad_policy_question(question)
+            and not question_subject_terms
+        )
+        if not question_words:
+            return self._safe_no_answer("the question does not contain a specific evidence concept")
+        expects_temporal_answer = self._expects_temporal_answer(question)
         candidate_sentences = []
 
         for chunk in retrieved_chunks:
             source = chunk["source"]
             for sentence in self._split_sentences(chunk["text"]):
-                sentence_words = self._normalized_word_set(sentence)
+                sentence_words = self._evidence_terms(sentence)
                 overlap = len(question_words.intersection(sentence_words))
+                evidence_coverage = overlap / len(question_words)
                 candidate_sentences.append({
                     "sentence": sentence,
                     "source": source,
+                    "matched_question_terms": question_words.intersection(sentence_words),
+                    "subject_overlap": len(question_subject_terms.intersection(sentence_words)),
                     "overlap": overlap,
+                    "evidence_coverage": evidence_coverage,
+                    "answer_type_supported": (
+                        not expects_temporal_answer
+                        or self._contains_temporal_evidence(sentence)
+                    ),
                     "similarity_score": chunk.get("similarity_score", 0)
                 })
 
@@ -362,12 +565,65 @@ class SimpleRAGPipeline:
 
         candidate_sentences = sorted(
             candidate_sentences,
-            key=lambda x: (x["overlap"], x["similarity_score"]),
+            key=lambda x: (
+                x["subject_overlap"],
+                x["evidence_coverage"],
+                x["overlap"],
+                x["similarity_score"],
+            ),
             reverse=True
         )
 
-        useful_sentences = [item for item in candidate_sentences if item["overlap"] > 0]
-        selected = useful_sentences[:2] if useful_sentences else candidate_sentences[:1]
+        deduplicated_candidates = []
+        seen_sentences = set()
+        for item in candidate_sentences:
+            identity = self._sentence_identity(item["sentence"])
+            if identity in seen_sentences:
+                continue
+            seen_sentences.add(identity)
+            deduplicated_candidates.append(item)
+
+        useful_sentences = [
+            item for item in deduplicated_candidates
+            if item["overlap"] > 0
+            and item["evidence_coverage"] >= self.min_question_coverage
+            and item["answer_type_supported"]
+        ]
+        if not useful_sentences:
+            return self._safe_no_answer("no retrieved sentence sufficiently supports the question")
+
+        # Always use the strongest sentence. Add a second only when it covers a
+        # new question concept, matches the primary intent equally, or is an
+        # explicit continuation. A lower-ranked strict subset is contextual
+        # evidence, not part of the direct answer.
+        selected = [useful_sentences[0]]
+        primary_terms = set(useful_sentences[0]["matched_question_terms"])
+        covered_terms = set(primary_terms)
+        primary_polarity = self._permission_polarity(useful_sentences[0]["sentence"])
+        continuation_pattern = re.compile(
+            r"^(?:also|additionally|in addition|furthermore|moreover|"
+            r"并且|此外|另外|还)",
+            flags=re.IGNORECASE,
+        )
+        for item in useful_sentences[1:]:
+            matched_terms = set(item["matched_question_terms"])
+            contributes_new_concept = bool(matched_terms - covered_terms)
+            matches_primary_intent = matched_terms == primary_terms
+            continues_primary = bool(continuation_pattern.match(item["sentence"]))
+            candidate_polarity = self._permission_polarity(item["sentence"])
+            reverses_primary = (
+                not broad_policy_summary
+                and
+                primary_polarity in {"positive", "negative"}
+                and candidate_polarity in {"positive", "negative"}
+                and primary_polarity != candidate_polarity
+            )
+            if not reverses_primary and (
+                contributes_new_concept or matches_primary_intent or continues_primary
+            ):
+                selected.append(item)
+                covered_terms.update(matched_terms)
+                break
 
         answer_parts = [item["sentence"] for item in selected]
         sources = sorted({item["source"] for item in selected})
