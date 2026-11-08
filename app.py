@@ -8,6 +8,13 @@ if str(PROJECT_PATH) not in sys.path:
     sys.path.insert(0, str(PROJECT_PATH))
 
 from src.document_loader import load_markdown_documents, validate_documents
+from src.document_manager import (
+    DEFAULT_ENTERPRISE_DOCUMENT_DIR,
+    DocumentValidationError,
+    add_enterprise_document,
+    list_enterprise_documents,
+    reindex_enterprise_documents,
+)
 from src.text_splitter import create_chunks
 from src.retrieval import build_vector_store
 from src.rag_pipeline import SimpleRAGPipeline
@@ -75,6 +82,70 @@ if st.button("Ask") and question.strip():
     for i, chunk in enumerate(response["retrieved_chunks"], start=1):
         with st.expander(f"Retrieved Chunk {i}: {chunk['source']} | Score: {chunk.get('similarity_score', 0):.4f}"):
             st.write(chunk["text"])
+
+st.divider()
+st.subheader("Enterprise document management")
+st.caption(
+    "Manage a separate enterprise document collection. These files do not change "
+    "the legacy benchmark corpus or the current Q&A assistant."
+)
+
+st.session_state.setdefault("enterprise_document_index", None)
+
+with st.container(border=True):
+    with st.form("enterprise_document_upload", clear_on_submit=True):
+        uploaded_document = st.file_uploader(
+            "Add a Markdown or text document",
+            type=["md", "txt"],
+            accept_multiple_files=False,
+        )
+        add_submitted = st.form_submit_button("Add document")
+
+    if add_submitted:
+        if uploaded_document is None:
+            st.error("Choose a .md or .txt document before submitting.")
+        else:
+            try:
+                added_path = add_enterprise_document(
+                    uploaded_document.name,
+                    uploaded_document.getvalue(),
+                    DEFAULT_ENTERPRISE_DOCUMENT_DIR,
+                )
+                st.session_state["enterprise_document_index"] = None
+                st.success(f"Added {added_path.name}. Reindex the collection to include it.")
+            except DocumentValidationError as exc:
+                st.error(str(exc))
+
+    enterprise_documents = list_enterprise_documents(DEFAULT_ENTERPRISE_DOCUMENT_DIR)
+    if enterprise_documents:
+        st.dataframe(enterprise_documents, hide_index=True)
+    else:
+        st.info("No enterprise documents have been added yet.")
+
+    if st.button("Validate and reindex collection"):
+        try:
+            enterprise_index = reindex_enterprise_documents(
+                DEFAULT_ENTERPRISE_DOCUMENT_DIR,
+                chunk_size=chunk_size,
+                overlap=overlap,
+                retrieval_mode=retrieval_mode,
+                semantic_backend=semantic_backend,
+            )
+            st.session_state["enterprise_document_index"] = enterprise_index
+            st.success(
+                f"Indexed {enterprise_index.document_count} documents into "
+                f"{enterprise_index.chunk_count} chunks."
+            )
+        except (DocumentValidationError, ImportError, ValueError) as exc:
+            st.error(str(exc))
+
+    current_enterprise_index = st.session_state["enterprise_document_index"]
+    if current_enterprise_index is not None:
+        st.caption(
+            f"Current session index: {current_enterprise_index.document_count} documents, "
+            f"{current_enterprise_index.chunk_count} chunks, "
+            f"{current_enterprise_index.retrieval_mode}/{current_enterprise_index.semantic_backend}."
+        )
 
 st.divider()
 st.subheader("Evaluation Design")
