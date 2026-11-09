@@ -1,6 +1,8 @@
-# AI-Assisted Testing
+# Legacy AI-Assisted Testing Compatibility
 
-This module adds the "Using AI for Testing" side of the project. It turns requirements into structured, reusable testing assets that can feed the existing RAG evaluation workflow.
+> **Status:** Retained for backward compatibility. The `ai_testing` package, generated assets, FastAPI `/testing/generate` endpoint, tests, and CI step remain operational, but this workflow is not the primary Enterprise Documentation Assistant feature set.
+
+This module documents the repository's historical "Using AI for Testing" capability. It turns requirements into structured, reusable testing assets that can feed the preserved RAG evaluation workflow.
 
 ## Purpose
 
@@ -16,7 +18,7 @@ The AI-assisted testing layer adds:
 Can we use AI-style generation to improve test design and failure analysis?
 ```
 
-The result is a single quality-engineering workflow:
+The retained compatibility workflow is:
 
 ```text
 Requirement -> Test Assets -> Execution -> Evaluation -> Failure Analysis -> Quality Summary
