@@ -12,6 +12,7 @@ from src.grounded_llm import (
     build_llm_client_from_env,
     get_llm_provider_status,
     quarantine_document_instructions,
+    _same_permission_scope,
     _validate_answer_facts,
 )
 
@@ -269,6 +270,212 @@ def test_permission_polarity_rejects_english_and_chinese_reversals(
                 "source": "remote_access_policy.md",
                 "chunk_id": "remote_access_policy.md:0",
                 "text": evidence,
+            }],
+        )
+
+
+def test_permission_validation_accepts_distinct_remote_and_on_site_clauses():
+    evidence = (
+        "Contractors are not permitted to access company systems remotely. "
+        "Contractors may access approved systems only while physically on site "
+        "and supervised by an authorized employee."
+    )
+    answers = [
+        "Contractors cannot access company systems remotely.",
+        (
+            "Contractors may access approved systems only while physically on site "
+            "and supervised by an authorized employee."
+        ),
+        (
+            "No. Contractors cannot access company systems remotely, but they may "
+            "access approved systems only while physically on site and supervised "
+            "by an authorized employee."
+        ),
+    ]
+
+    for answer in answers:
+        references = _validate_answer_facts(
+            answer,
+            ["contractor_policy.md"],
+            [{
+                "source": "contractor_policy.md",
+                "chunk_id": "contractor_policy.md_chunk_0",
+                "text": evidence,
+            }],
+        )
+        assert references
+
+
+@pytest.mark.parametrize(
+    "remote_claim, on_site_evidence",
+    [
+        (
+            "Contractors cannot access company systems remotely.",
+            "Contractors may access approved systems only while physically on site.",
+        ),
+        (
+            "外包人员不得远程访问公司系统。",
+            "外包人员只有在现场时才可以访问批准的系统。",
+        ),
+    ],
+)
+def test_permission_scope_distinguishes_remote_and_on_site_access(
+    remote_claim,
+    on_site_evidence,
+):
+    assert not _same_permission_scope(remote_claim, on_site_evidence)
+
+
+def test_permission_validation_accepts_employee_remote_access_conditions():
+    evidence = (
+        "Employees may access company systems remotely only through the company VPN "
+        "and multi-factor authentication."
+    )
+    answer = (
+        "Employees may access company systems remotely only through the company VPN "
+        "and multi-factor authentication."
+    )
+
+    references = _validate_answer_facts(
+        answer,
+        ["access_policy.md"],
+        [{
+            "source": "access_policy.md",
+            "chunk_id": "access_policy.md_chunk_0",
+            "text": evidence,
+        }],
+    )
+
+    assert references[0]["chunk_id"] == "access_policy.md_chunk_0"
+
+
+@pytest.mark.parametrize(
+    "evidence, answer",
+    [
+        (
+            "外包人员不得远程访问公司系统；只有在现场并由授权员工监督时，才可以访问经过批准的系统。",
+            "外包人员不得远程访问公司系统；但是可以在现场并由授权员工监督时访问经过批准的系统。",
+        ),
+        (
+            "员工只有使用公司 VPN 和多因素身份验证时，才可以远程访问公司系统。",
+            "员工只有使用公司 VPN 和多因素身份验证时，才可以远程访问公司系统。",
+        ),
+    ],
+)
+def test_permission_validation_accepts_chinese_scoped_permissions(evidence, answer):
+    references = _validate_answer_facts(
+        answer,
+        ["access_policy_zh.md"],
+        [{
+            "source": "access_policy_zh.md",
+            "chunk_id": "access_policy_zh.md_chunk_0",
+            "text": evidence,
+        }],
+    )
+
+    assert references
+
+
+def test_faq_compound_permission_answer_is_not_a_false_reversal(tmp_path):
+    add_enterprise_document(
+        "contractor_faq.md",
+        (
+            "**Q: Are employees allowed to access systems remotely?**\n"
+            "A: Yes, if they use the company VPN and MFA.\n\n"
+            "**Q: Can contractors access company systems remotely?**\n"
+            "A: No. Contractors may only access approved resources on site under "
+            "authorized supervision."
+        ),
+        tmp_path,
+    )
+    index = build_index(tmp_path)
+    client = MockLLMClient({
+        "supported": True,
+        "answer": (
+            "No. Contractors cannot access remotely, but may access approved resources "
+            "on site under authorized supervision."
+        ),
+        "citations": ["contractor_faq.md"],
+    })
+
+    response = ask_llm(
+        tmp_path,
+        index,
+        "Can contractors access systems remotely?",
+        client,
+    )
+
+    assert response["status"] == "answered"
+    assert response["supporting_sources"] == ["contractor_faq.md"]
+    assert len(response["evidence_references"]) == 2
+    assert "contractors access company systems remotely" in (
+        response["evidence_references"][0]["evidence_span"].lower()
+    )
+    assert "on site" in response["evidence_references"][1]["evidence_span"].lower()
+
+
+def test_observed_live_coordinated_permission_answer_is_grounded(tmp_path):
+    add_enterprise_document(
+        "enterprise_document_management_demo.md",
+        (
+            "Contractors are not permitted to access company systems remotely.\n"
+            "Contractors may access approved systems only while physically on site "
+            "and supervised by an authorized employee.\n\n"
+            "**Q: Can contractors access company systems remotely?**\n"
+            "A: No. Contractors may only access approved resources on site under "
+            "authorized supervision."
+        ),
+        tmp_path,
+    )
+    index = build_index(tmp_path)
+    observed_live_answer = (
+        "No, contractors may only access approved resources on site under authorized "
+        "supervision and are not permitted to access company systems remotely."
+    )
+    client = MockLLMClient({
+        "supported": True,
+        "answer": observed_live_answer,
+        "citations": ["enterprise_document_management_demo.md"],
+    })
+    diagnostics = []
+
+    response = ask_grounded_llm_question(
+        "Can contractors access systems remotely?",
+        index,
+        tmp_path,
+        client=client,
+        diagnostics_callback=diagnostics.append,
+        **SETTINGS,
+    )
+
+    assert response["status"] == "answered"
+    assert response["answer"] == observed_live_answer
+    assert len(response["evidence_references"]) == 2
+    assert "on site" in response["evidence_references"][0]["evidence_span"].lower()
+    assert "not permitted" in response["evidence_references"][1]["claim"].lower()
+    assert diagnostics[0]["claims"] == [
+        "No, contractors may only access approved resources on site under authorized supervision",
+        "contractors are not permitted to access company systems remotely.",
+    ]
+    assert not any(
+        comparison["permission_reversal_triggered"]
+        for comparison in diagnostics[0]["permission_comparisons"]
+    )
+
+
+def test_faq_genuine_contractor_remote_permission_reversal_is_rejected():
+    with pytest.raises(GroundedLLMResponseError, match="permission or prohibition"):
+        _validate_answer_facts(
+            "Contractors are allowed to access company systems remotely.",
+            ["contractor_faq.md"],
+            [{
+                "source": "contractor_faq.md",
+                "chunk_id": "contractor_faq.md_chunk_10",
+                "text": (
+                    "**Q: Can contractors access company systems remotely?**\n"
+                    "A: No. Contractors may only access approved resources on site "
+                    "under authorized supervision."
+                ),
             }],
         )
 

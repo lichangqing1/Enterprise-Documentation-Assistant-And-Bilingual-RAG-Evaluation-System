@@ -114,11 +114,66 @@ class SimpleRAGPipeline:
 
     def retrieve(self, question: str) -> List[Dict[str, object]]:
         """Retrieve relevant chunks from the vector store."""
-        return self.vector_store.search(question, top_k=self.top_k)
+        retrieved = self.vector_store.search(question, top_k=self.top_k)
+        return self._expand_markdown_table_context(retrieved)
+
+    @staticmethod
+    def _has_markdown_table_syntax(text: str) -> bool:
+        return any(
+            line.strip().startswith("|") and line.count("|") >= 2
+            for line in text.splitlines()
+        )
+
+    def _expand_markdown_table_context(
+        self,
+        retrieved_chunks: List[Dict[str, object]],
+    ) -> List[Dict[str, object]]:
+        """Include adjacent indexed chunks needed to reconstruct split table rows."""
+        indexed_chunks = getattr(self.vector_store, "chunks", None)
+        if not isinstance(indexed_chunks, list):
+            return retrieved_chunks
+
+        chunk_lookup = {
+            (str(chunk.get("source", "")), chunk.get("chunk_index")): chunk
+            for chunk in indexed_chunks
+            if isinstance(chunk.get("chunk_index"), int)
+        }
+        expanded = list(retrieved_chunks)
+        seen = {
+            (str(chunk.get("source", "")), chunk.get("chunk_index"))
+            for chunk in expanded
+        }
+        table_context_queue = [
+            chunk for chunk in retrieved_chunks
+            if self._has_markdown_table_syntax(str(chunk.get("text", "")))
+        ]
+        inspected = set()
+        while table_context_queue:
+            chunk = table_context_queue.pop(0)
+            chunk_index = chunk.get("chunk_index")
+            source = str(chunk.get("source", ""))
+            current_key = (source, chunk_index)
+            if not isinstance(chunk_index, int) or current_key in inspected:
+                continue
+            inspected.add(current_key)
+            for adjacent_index in (chunk_index - 1, chunk_index + 1):
+                key = (source, adjacent_index)
+                adjacent = chunk_lookup.get(key)
+                if adjacent is None or key in seen:
+                    continue
+                context_chunk = dict(adjacent)
+                context_chunk["similarity_score"] = 0.0
+                context_chunk["retrieval_mode"] = "adjacent_table_context"
+                context_chunk["retrieval_method"] = "adjacent_table_context"
+                expanded.append(context_chunk)
+                seen.add(key)
+                if self._has_markdown_table_syntax(str(context_chunk.get("text", ""))):
+                    table_context_queue.append(context_chunk)
+        return expanded
 
     @staticmethod
     def _split_sentences(text: str) -> List[str]:
-        """Split prose and Markdown lists without attaching heading text."""
+        """Split answerable prose without returning headings or FAQ questions."""
         blocks = []
         paragraph_lines = []
 
@@ -130,6 +185,34 @@ class SimpleRAGPipeline:
         for raw_line in text.strip().splitlines():
             line = raw_line.strip()
             if not line:
+                flush_paragraph()
+                continue
+            faq_line = re.sub(r"^[>*_`~\s]+|[*_`~\s]+$", "", line)
+            faq_question = re.match(
+                r"^(?:q(?:uestion)?|问(?:题)?)\s*[:：]\s*(.*)$",
+                faq_line,
+                flags=re.IGNORECASE,
+            )
+            if faq_question:
+                # The full chunk is retained in retrieved evidence, but an FAQ
+                # prompt is context for its answer rather than answer content.
+                flush_paragraph()
+                continue
+            faq_answer = re.match(
+                r"^(?:a(?:nswer)?|答(?:案)?)\s*[:：]\s*(.*)$",
+                faq_line,
+                flags=re.IGNORECASE,
+            )
+            if faq_answer:
+                flush_paragraph()
+                answer_text = faq_answer.group(1).strip()
+                if answer_text:
+                    paragraph_lines.append(answer_text)
+                continue
+            if line.startswith("|") or line.count("|") >= 2:
+                # Markdown tables are handled as structured evidence. Treating
+                # their rows as prose joins headers, separators, neighboring
+                # rows, and character-truncated fragments into one answer.
                 flush_paragraph()
                 continue
             if re.match(r"^#{1,6}\s+", line):
@@ -157,6 +240,233 @@ class SimpleRAGPipeline:
         """Return a stable key for duplicate sentences from overlapping chunks."""
         without_markdown = re.sub(r"[*_`~]", "", sentence)
         return re.sub(r"\s+", " ", without_markdown).strip().lower()
+
+    @staticmethod
+    def _merge_overlapping_chunk_text(left: str, right: str) -> str:
+        """Reconstruct adjacent character chunks without duplicating overlap."""
+        maximum = min(len(left), len(right))
+        for size in range(maximum, 7, -1):
+            if left[-size:] == right[:size]:
+                return left + right[size:]
+        return left.rstrip() + "\n" + right.lstrip()
+
+    @classmethod
+    def _retrieved_source_segments(
+        cls,
+        retrieved_chunks: List[Dict[str, object]],
+    ) -> List[Dict[str, str]]:
+        """Rebuild only contiguous retrieved chunks for safe table parsing."""
+        grouped: Dict[str, List[Dict[str, object]]] = {}
+        for chunk in retrieved_chunks:
+            grouped.setdefault(str(chunk.get("source", "")), []).append(dict(chunk))
+
+        segments = []
+        for source, chunks in grouped.items():
+            indexed = all(isinstance(chunk.get("chunk_index"), int) for chunk in chunks)
+            if not indexed:
+                segments.extend(
+                    {"source": source, "text": str(chunk.get("text", ""))}
+                    for chunk in chunks
+                )
+                continue
+
+            ordered = sorted(chunks, key=lambda chunk: int(chunk["chunk_index"]))
+            segment_text = ""
+            previous_index = None
+            for chunk in ordered:
+                chunk_index = int(chunk["chunk_index"])
+                chunk_text = str(chunk.get("text", ""))
+                if previous_index is None or chunk_index != previous_index + 1:
+                    if segment_text:
+                        segments.append({"source": source, "text": segment_text})
+                    segment_text = chunk_text
+                else:
+                    segment_text = cls._merge_overlapping_chunk_text(segment_text, chunk_text)
+                previous_index = chunk_index
+            if segment_text:
+                segments.append({"source": source, "text": segment_text})
+        return segments
+
+    @staticmethod
+    def _markdown_table_cells(line: str) -> List[str]:
+        """Return complete Markdown table cells or an empty list for fragments."""
+        stripped = line.strip()
+        if not stripped.startswith("|") or not stripped.endswith("|"):
+            return []
+        cells = [
+            re.sub(r"[*_`~]", "", cell).strip()
+            for cell in stripped[1:-1].split("|")
+        ]
+        return cells if len(cells) >= 2 else []
+
+    @staticmethod
+    def _is_markdown_table_separator(cells: List[str]) -> bool:
+        return bool(cells) and all(
+            re.fullmatch(r":?-{3,}:?", cell.replace(" ", ""))
+            for cell in cells
+        )
+
+    @classmethod
+    def _markdown_tables(
+        cls,
+        retrieved_chunks: List[Dict[str, object]],
+    ) -> List[Dict[str, object]]:
+        """Parse complete rows from tables present in contiguous retrieved text."""
+        tables = []
+        for segment in cls._retrieved_source_segments(retrieved_chunks):
+            lines = str(segment["text"]).splitlines()
+            for position in range(len(lines) - 1):
+                headers = cls._markdown_table_cells(lines[position])
+                separator = cls._markdown_table_cells(lines[position + 1])
+                if (
+                    not headers
+                    or len(separator) != len(headers)
+                    or not cls._is_markdown_table_separator(separator)
+                ):
+                    continue
+
+                rows = []
+                row_position = position + 2
+                while row_position < len(lines):
+                    line = lines[row_position].strip()
+                    if not line:
+                        break
+                    if not line.startswith("|"):
+                        break
+                    cells = cls._markdown_table_cells(line)
+                    if len(cells) == len(headers) and all(cells):
+                        rows.append(cells)
+                    # A character-split fragment is ignored. Continue across it
+                    # so a complete overlapping copy in the next chunk can be used.
+                    row_position += 1
+                if rows:
+                    tables.append({
+                        "source": segment["source"],
+                        "headers": headers,
+                        "rows": rows,
+                    })
+        return tables
+
+    @classmethod
+    def _table_question_terms(cls, question: str) -> Set[str]:
+        """Add small bilingual concept aliases for matching table headers."""
+        terms = set(cls._evidence_terms(question))
+        aliases = {
+            "响应": {"response"},
+            "目标": {"target"},
+            "首次": {"initial"},
+            "升级": {"escalation"},
+            "责任": {"responsibility"},
+            "负责人": {"owner", "lead", "responsibility"},
+            "严重级别": {"severity"},
+        }
+        for phrase, mapped_terms in aliases.items():
+            if phrase in question:
+                terms.update(mapped_terms)
+        return terms
+
+    @classmethod
+    def _select_markdown_table_fact(
+        cls,
+        question: str,
+        retrieved_chunks: List[Dict[str, object]],
+    ) -> Dict[str, str] | None:
+        """Select one unambiguous row/column fact supported by a complete table."""
+        question_terms = cls._table_question_terms(question)
+        candidates = []
+        for table in cls._markdown_tables(retrieved_chunks):
+            headers = list(table["headers"])
+            for column_index, header in enumerate(headers):
+                if column_index == 0:
+                    continue
+                header_terms = cls._evidence_terms(header)
+                column_overlap = len(question_terms.intersection(header_terms))
+                if column_overlap == 0:
+                    continue
+                for row in table["rows"]:
+                    row_label = row[0]
+                    row_terms = cls._evidence_terms(row_label)
+                    row_overlap = len(question_terms.intersection(row_terms))
+                    value = row[column_index].strip()
+                    if row_overlap == 0 or not value:
+                        continue
+                    candidates.append({
+                        "source": str(table["source"]),
+                        "row_label": row_label,
+                        "header": header,
+                        "value": value,
+                        "row_overlap": row_overlap,
+                        "column_overlap": column_overlap,
+                    })
+
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda item: (item["row_overlap"], item["column_overlap"]),
+            reverse=True,
+        )
+        best_score = (candidates[0]["row_overlap"], candidates[0]["column_overlap"])
+        best = [
+            item for item in candidates
+            if (item["row_overlap"], item["column_overlap"]) == best_score
+        ]
+        distinct_facts = {
+            (item["row_label"].lower(), item["header"].lower(), item["value"].lower())
+            for item in best
+        }
+        if len(distinct_facts) != 1:
+            return None
+        selected = dict(best[0])
+        selected["sources"] = ", ".join(sorted({item["source"] for item in best}))
+        return selected
+
+    @staticmethod
+    def _chinese_table_value(value: str) -> str:
+        """Render common documented durations in Chinese without changing facts."""
+        match = re.fullmatch(
+            r"within\s+(\d+(?:\.\d+)?)\s+(business\s+)?(hours?|days?)",
+            value.strip(),
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return value
+        number, business, unit = match.groups()
+        if unit.lower().startswith("hour"):
+            return f"{number} 小时内"
+        return f"{number} 个{'工作日' if business else '自然日'}内"
+
+    @classmethod
+    def _format_markdown_table_answer(
+        cls,
+        question: str,
+        fact: Dict[str, str],
+    ) -> str:
+        """Turn a selected table cell into a concise cited extractive answer."""
+        row_label = fact["row_label"]
+        header = fact["header"]
+        value = fact["value"]
+        if cls._contains_chinese(question):
+            if "响应" in question and "target" in header.lower():
+                sentence = f"{row_label} 事故的首次响应目标是{cls._chinese_table_value(value)}。"
+            elif "升级" in question or "责任" in question or "负责人" in question:
+                sentence = f"{row_label} 事故的升级责任是{value}。"
+            else:
+                sentence = f"{row_label} 的{header}是{value}。"
+        else:
+            label_match = re.search(
+                rf"\b{re.escape(row_label)}\b(?:[-\s]+[A-Za-z]+)?",
+                question,
+                flags=re.IGNORECASE,
+            )
+            subject = label_match.group(0) if label_match else row_label
+            article = "an" if re.match(r"[aeiou]", subject, flags=re.IGNORECASE) else "a"
+            header_label = header.lower()
+            if header_label == "escalation" and "responsib" in question.lower():
+                header_label = "escalation responsibility"
+            if value.lower().startswith(("within ", "every ", "before ", "after ")):
+                value = value[0].lower() + value[1:]
+            sentence = f"The {header_label} for {article} {subject} is {value}."
+        return f"{sentence} Source: {fact['sources']}."
 
     @staticmethod
     def _permission_polarity(text: str) -> str:
@@ -521,13 +831,21 @@ class SimpleRAGPipeline:
         if not retrieved_chunks:
             return self._safe_no_answer("no retrieved evidence")
 
+        table_fact = self._select_markdown_table_fact(question, retrieved_chunks)
         should_refuse, reason = self._should_refuse_as_unanswerable(question, retrieved_chunks)
-        if should_refuse:
+        table_fact_resolves_cross_language_coverage = (
+            table_fact is not None
+            and reason.startswith("low question-evidence coverage")
+        )
+        if should_refuse and not table_fact_resolves_cross_language_coverage:
             return self._safe_no_answer(reason)
 
         best_score = retrieved_chunks[0].get("similarity_score", 0)
         if best_score < self.min_similarity_score:
             return self._safe_no_answer("retrieval similarity below threshold")
+
+        if table_fact is not None:
+            return self._format_markdown_table_answer(question, table_fact)
 
         question_words = self._evidence_question_terms(question)
         question_subject_terms = self._question_subject_terms(question)

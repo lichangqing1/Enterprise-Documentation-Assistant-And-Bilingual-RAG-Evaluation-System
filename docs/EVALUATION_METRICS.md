@@ -1,11 +1,11 @@
 # Evaluation Metrics
 
-This project reports deterministic RAG evaluation proxies with industry-facing names while keeping a few legacy column aliases for backward compatibility.
+This project reports deterministic RAG evaluation proxies with industry-facing names while keeping a few legacy column aliases for backward compatibility. These metrics are transparent regression checks, not external RAGAS or LLM-judge scores.
 
 The metrics are used by two workflows:
 
 - the RAG evaluation scripts, which score the current assistant behavior;
-- the AI-assisted testing workflow, which turns generated test assets and failed cases into structured quality summaries.
+- the retained AI-assisted testing compatibility workflow, which turns generated test assets and failed cases into structured quality summaries.
 
 ## Evaluation Layer
 
@@ -13,12 +13,14 @@ The framework uses a compact evaluator design inspired by benchmark systems such
 
 - **Dataset**: CSV files under `data/evaluation/` define questions, expected answers, expected sources, expected keywords, and task labels.
 - **Inferencer**: `src/rag_pipeline.py` retrieves evidence and generates source-cited extractive answers.
-- **Evaluator**: `src/evaluator.py` computes retrieval, faithfulness, citation, hallucination-risk, and safety metrics.
+- **Evaluator**: `src/evaluation/evaluator.py` computes retrieval, faithfulness, citation, hallucination-risk, and safety metrics.
 - **Reporter**: `src/report_generator.py` writes CSV and Markdown reports under `results/`.
 - **Regression gate**: `scripts/run_regression_checks.py` checks minimum quality thresholds.
 - **AI-assisted testing**: `ai_testing/quality_summary.py` and `ai_testing/failure_analyzer.py` reuse deterministic metric outputs for release summaries and RCA suggestions.
 
 Future adapters for tools such as RAGAS, DeepEval, or OpenCompass can be added without changing the current deterministic evaluator.
+
+The separate enterprise safety suite stores case-level expected behavior, actual behavior, outcomes, failure reasons, severity, and corpus-isolation status in `results/enterprise_safety_evaluation_results.csv`. It uses mocked providers and is not folded into the main 73-case metric summary.
 
 ## Metric Name Mapping
 
@@ -291,3 +293,18 @@ This keeps the workflow reliable:
 Regression thresholds are configured in `configs/rag_eval_config.yaml` under `quality_gates`.
 
 `scripts/run_regression_checks.py` reads those values at runtime, which keeps local validation and CI aligned.
+
+## Evaluation Dashboard Categories
+
+`src/quality_reporting.py` maps saved artifacts into additional review categories without changing evaluator outputs or quality gates:
+
+| Category | Measurement status |
+|---|---|
+| False acceptance | Directly measured from unanswerable and enterprise unsupported-question cases |
+| False refusal | Derived phrase-based diagnostic; not a quality gate |
+| Answer over-extraction | Not measured by a dedicated persisted benchmark metric |
+| Citation validation failure | Direct benchmark flags and enterprise citation-fabrication case |
+| Numerical or polarity contradiction | Dedicated enterprise safety cases |
+| Prompt-injection compliance | Relevant enterprise and legacy security cases |
+
+The dashboard does not infer historical failure counts from pytest tests or claim comprehensive detection.

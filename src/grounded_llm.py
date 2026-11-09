@@ -6,7 +6,7 @@ import os
 import re
 import socket
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Callable, Dict, Optional, Union
 from urllib.error import HTTPError, URLError
 
 from ai_testing.llm_client import LLMClient, OpenAICompatibleJSONClient, parse_json_response
@@ -25,6 +25,9 @@ class GroundedLLMProviderError(RuntimeError):
 
 class GroundedLLMResponseError(RuntimeError):
     """Raised when an LLM response fails schema or citation validation."""
+
+
+ValidationDiagnosticCallback = Callable[[Dict[str, object]], None]
 
 
 _DOCUMENT_INSTRUCTION_PATTERNS = tuple(
@@ -73,8 +76,10 @@ def quarantine_document_instructions(
     quarantined: list[Dict[str, str]] = []
     for chunk in retrieved_chunks:
         safe_spans = []
+        removed_instruction = False
         for span in _split_document_spans(str(chunk.get("text", ""))):
             if is_document_instruction_like(span):
+                removed_instruction = True
                 quarantined.append({
                     "source": str(chunk.get("source", "")),
                     "chunk_id": str(chunk.get("chunk_id", "")),
@@ -84,7 +89,10 @@ def quarantine_document_instructions(
                 safe_spans.append(span)
         if safe_spans:
             sanitized = dict(chunk)
-            sanitized["text"] = " ".join(safe_spans)
+            # Preserve legitimate layout, especially FAQ question/answer line
+            # boundaries. Reconstruct text only when an unsafe span was removed.
+            if removed_instruction:
+                sanitized["text"] = "\n".join(safe_spans)
             sanitized_chunks.append(sanitized)
     return sanitized_chunks, quarantined
 
@@ -236,14 +244,18 @@ def _contains_explicit_negation(text: str) -> bool:
 def _permission_polarity(text: str) -> str:
     """Classify explicit permission/prohibition language conservatively."""
     negative_patterns = (
+        r"\b(?:a|answer)\s*:\s*no\b",
         r"\bnot\s+(?:allowed|permitted|authorized)\b",
         r"\b(?:must|may|can|could|should)\s+not\b",
         r"\b(?:cannot|can't|prohibited|forbidden|disallowed)\b",
+        r"(?:答|回答)\s*[：:]\s*(?:否|不可以|不能)",
         r"(?:不允许|禁止|不得|不能|不可|不可以|未获准|无权)",
     )
     positive_patterns = (
+        r"\b(?:a|answer)\s*:\s*yes\b",
         r"\b(?:allowed|permitted|authorized)\b",
         r"\bmay\b",
+        r"(?:答|回答)\s*[：:]\s*(?:是|可以)",
         r"(?:允许|可以|获准|有权)",
     )
     if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in negative_patterns):
@@ -251,6 +263,164 @@ def _permission_polarity(text: str) -> str:
     if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in positive_patterns):
         return "positive"
     return "neutral"
+
+
+def _split_permission_claims(text: str) -> list[str]:
+    """Split contrasting permission clauses before polarity comparison.
+
+    A single generated sentence can legitimately contain a prohibition and a
+    conditional permission, for example remote access being forbidden while
+    supervised on-site access is allowed. Treating that whole sentence as one
+    polarity makes the closest evidence span look contradictory.
+    """
+    clauses = []
+    clause_boundary = re.compile(
+        r"\s*[;；]\s*|"
+        r"\s*,?\s+\b(?:but|whereas|however)\b\s+|"
+        r"\s+\b(?:and|while)\b\s+"
+        r"(?=(?:(?:[a-z][a-z'-]*\s+){0,4})"
+        r"(?:is|are|may|can|cannot|can't|must|should|could)\b)|"
+        r"[，,]\s*(?=(?:但|但是|然而|而|只有|仅在|同时))",
+        flags=re.IGNORECASE,
+    )
+    spans = _split_document_spans(text)
+    position = 0
+    while position < len(spans):
+        span = spans[position]
+        if (
+            position + 1 < len(spans)
+            and re.fullmatch(r"(?:no|yes|否|是)[.!。！]?", span, flags=re.IGNORECASE)
+        ):
+            span = f"{span} {spans[position + 1]}"
+            position += 1
+        span_clauses = [
+            clause.strip(" ,，;；")
+            for clause in clause_boundary.split(span)
+            if clause.strip(" ,，;；")
+        ]
+        inherited_actor = _permission_actor_phrase(span_clauses[0]) if span_clauses else ""
+        for clause in span_clauses:
+            if (
+                inherited_actor
+                and re.match(
+                    r"^(?:is|are|may|can|cannot|can't|must|should|could)\b",
+                    clause,
+                    flags=re.IGNORECASE,
+                )
+            ):
+                clause = f"{inherited_actor} {clause}"
+            clauses.append(clause)
+        position += 1
+    return clauses
+
+
+def _evidence_permission_spans(text: str) -> list[str]:
+    """Preserve short FAQ yes/no answers with the question they qualify."""
+    spans = _split_document_spans(text)
+    combined = []
+    position = 0
+    while position < len(spans):
+        current = re.sub(r"[*_`~]", "", spans[position]).strip()
+        following = (
+            re.sub(r"[*_`~]", "", spans[position + 1]).strip()
+            if position + 1 < len(spans)
+            else ""
+        )
+        is_question = bool(re.match(r"^(?:q|question|问)\s*[：:]", current, flags=re.IGNORECASE))
+        is_short_answer = bool(re.match(
+            r"^(?:a|answer|答|回答)\s*[：:]\s*(?:yes|no|是|否|可以|不可以|不能)\b",
+            following,
+            flags=re.IGNORECASE,
+        ))
+        if is_question and is_short_answer:
+            combined.append(f"{current} {following}")
+            position += 2
+            continue
+        combined.extend(_split_permission_claims(current))
+        position += 1
+    return combined
+
+
+def _permission_actor_phrase(text: str) -> str:
+    """Extract an explicit English actor phrase without inferring omitted actors."""
+    clean = re.sub(r"[*_`~]", "", text).lower().strip()
+    clean = re.sub(r"^(?:q|question|a|answer)\s*:\s*", "", clean)
+    clean = re.sub(r"^(?:no|yes)\s*[,.:;-]\s*", "", clean)
+    trailing = re.search(
+        r"\b(?:allowed|permitted|authorized)\s+for\s+([a-z][a-z\s-]{0,40})",
+        clean,
+    )
+    if trailing:
+        return trailing.group(1).strip()
+    question_actor = re.match(
+        r"^(?:can|may|could|are|is)\s+(.+?)\s+(?:access|use|enter|connect)\b",
+        clean,
+    )
+    if question_actor:
+        return question_actor.group(1).strip()
+    if re.match(
+        r"^(?:is|are|may|can|cannot|can't|must|should|could)\b",
+        clean,
+    ):
+        return ""
+    subject_actor = re.match(
+        r"^(.+?)\s+(?:may|can|cannot|can't|must|are|is)\b",
+        clean,
+    )
+    return subject_actor.group(1).strip() if subject_actor else ""
+
+
+def _permission_actor_terms(text: str) -> set[str]:
+    """Extract explicit English actors when permission grammar exposes them."""
+    return SimpleRAGPipeline._evidence_terms(_permission_actor_phrase(text))
+
+
+def _permission_scope_terms(text: str) -> set[str]:
+    """Return action and condition concepts without polarity marker words."""
+    polarity_terms = {
+        "allow", "permitt", "permit", "authoriz", "authorize", "may",
+        "can", "cannot", "can't", "must", "should", "could", "not",
+        "no", "yes", "answer",
+    }
+    return (
+        SimpleRAGPipeline._evidence_terms(text)
+        - _permission_actor_terms(text)
+        - polarity_terms
+    )
+
+
+def _access_location_modes(text: str) -> set[str]:
+    """Identify mutually distinct remote and physical-site access contexts."""
+    modes = set()
+    if re.search(r"\bremote(?:ly)?\b|远程", text, flags=re.IGNORECASE):
+        modes.add("remote")
+    if re.search(
+        r"\b(?:on[ -]?site|physically\s+(?:at|on)\s+(?:the\s+)?site)\b|现场",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        modes.add("on_site")
+    return modes
+
+
+def _same_permission_scope(claim: str, evidence_span: str) -> bool:
+    """Require compatible actors and actions/conditions for contradiction checks."""
+    claim_actors = _permission_actor_terms(claim)
+    evidence_actors = _permission_actor_terms(evidence_span)
+    if claim_actors and evidence_actors and not claim_actors.intersection(evidence_actors):
+        return False
+
+    claim_locations = _access_location_modes(claim)
+    evidence_locations = _access_location_modes(evidence_span)
+    if claim_locations and evidence_locations and claim_locations.isdisjoint(evidence_locations):
+        return False
+
+    claim_scope = _permission_scope_terms(claim)
+    evidence_scope = _permission_scope_terms(evidence_span)
+    if not claim_scope or not evidence_scope:
+        return False
+    overlap = len(claim_scope.intersection(evidence_scope))
+    return overlap >= 1 and overlap / min(len(claim_scope), len(evidence_scope)) >= 0.5
 
 
 def _claim_evidence_associations(
@@ -267,19 +437,37 @@ def _claim_evidence_associations(
         }
         for chunk in retrieved_chunks
         if str(chunk.get("source", "")) in citations
-        for span in _split_document_spans(str(chunk.get("text", "")))
+        for span in _evidence_permission_spans(str(chunk.get("text", "")))
     ]
     associations = []
-    for claim in _split_document_spans(answer):
+    for claim in _split_permission_claims(answer):
         claim_terms = SimpleRAGPipeline._evidence_terms(claim)
         candidates = []
         for evidence in evidence_spans:
-            evidence_terms = SimpleRAGPipeline._evidence_terms(str(evidence["evidence_span"]))
+            evidence_span = str(evidence["evidence_span"])
+            evidence_terms = SimpleRAGPipeline._evidence_terms(evidence_span)
             overlap_count = len(claim_terms.intersection(evidence_terms))
             overlap_score = overlap_count / max(len(claim_terms), 1)
-            candidates.append((overlap_score, overlap_count, evidence))
+            claim_actors = _permission_actor_terms(claim)
+            evidence_actors = _permission_actor_terms(evidence_span)
+            actor_match = int(
+                bool(claim_actors)
+                and bool(evidence_actors)
+                and bool(claim_actors.intersection(evidence_actors))
+            )
+            actor_mismatch = int(
+                bool(claim_actors)
+                and bool(evidence_actors)
+                and not claim_actors.intersection(evidence_actors)
+            )
+            candidates.append(
+                (actor_match, -actor_mismatch, overlap_score, overlap_count, evidence)
+            )
         if candidates:
-            score, count, best = max(candidates, key=lambda item: (item[0], item[1]))
+            _, _, score, count, best = max(
+                candidates,
+                key=lambda item: (item[0], item[1], item[2], item[3]),
+            )
             associations.append({
                 "claim": claim,
                 "source": best["source"],
@@ -304,6 +492,7 @@ def _validate_permission_polarity(associations: list[Dict[str, object]]) -> None
         )
         if (
             sufficiently_matched
+            and _same_permission_scope(claim, evidence_span)
             and claim_polarity in {"positive", "negative"}
             and evidence_polarity in {"positive", "negative"}
             and claim_polarity != evidence_polarity
@@ -312,6 +501,58 @@ def _validate_permission_polarity(associations: list[Dict[str, object]]) -> None
                 "The LLM answer reverses an explicit permission or prohibition "
                 f"in cited evidence chunk {association['chunk_id'] or '(unknown chunk)'}."
             )
+
+
+def _permission_validation_diagnostics(
+    associations: list[Dict[str, object]],
+) -> list[Dict[str, object]]:
+    """Describe deterministic permission comparisons without changing validation."""
+    diagnostics = []
+    for association in associations:
+        claim = str(association["claim"])
+        evidence_span = str(association["evidence_span"])
+        claim_polarity = _permission_polarity(claim)
+        evidence_polarity = _permission_polarity(evidence_span)
+        sufficiently_matched = (
+            int(association["overlap_count"]) >= 2
+            and float(association["term_overlap"]) >= 0.5
+        )
+        same_scope = _same_permission_scope(claim, evidence_span)
+        diagnostics.append({
+            **association,
+            "claim_actor_terms": sorted(_permission_actor_terms(claim)),
+            "claim_scope_terms": sorted(_permission_scope_terms(claim)),
+            "claim_location_modes": sorted(_access_location_modes(claim)),
+            "claim_polarity": claim_polarity,
+            "evidence_actor_terms": sorted(_permission_actor_terms(evidence_span)),
+            "evidence_scope_terms": sorted(_permission_scope_terms(evidence_span)),
+            "evidence_location_modes": sorted(_access_location_modes(evidence_span)),
+            "evidence_polarity": evidence_polarity,
+            "sufficiently_matched": sufficiently_matched,
+            "same_permission_scope": same_scope,
+            "permission_reversal_triggered": (
+                sufficiently_matched
+                and same_scope
+                and claim_polarity in {"positive", "negative"}
+                and evidence_polarity in {"positive", "negative"}
+                and claim_polarity != evidence_polarity
+            ),
+        })
+    return diagnostics
+
+
+def _emit_validation_diagnostic(
+    callback: Optional[ValidationDiagnosticCallback],
+    record: Dict[str, object],
+) -> None:
+    """Emit an explicitly requested local trace without affecting Q&A behavior."""
+    if callback is None:
+        return
+    try:
+        callback(record)
+    except Exception:
+        # Diagnostics must never change answer or safety behavior.
+        return
 
 
 def _validate_answer_facts(
@@ -403,6 +644,7 @@ def ask_grounded_llm_question(
     overlap: int = 100,
     retrieval_mode: str = "hybrid",
     semantic_backend: str = "local",
+    diagnostics_callback: Optional[ValidationDiagnosticCallback] = None,
 ) -> Dict[str, object]:
     """Generate an optional LLM answer grounded only in current enterprise evidence."""
     if not question.strip():
@@ -460,6 +702,7 @@ def ask_grounded_llm_question(
         for chunk in sanitized_chunks
         if str(chunk.get("source", ""))
     }
+    raw_provider_answer = payload.get("answer") if isinstance(payload, dict) else None
     supported, answer, citations = _validate_llm_payload(payload, retrieved_sources)
     if not supported:
         result.update({
@@ -472,6 +715,23 @@ def ask_grounded_llm_question(
         return result
 
     _validate_quarantined_instruction_influence(answer, quarantined_spans, sanitized_chunks)
+    associations = _claim_evidence_associations(answer, citations, sanitized_chunks)
+    _emit_validation_diagnostic(diagnostics_callback, {
+        "question": question,
+        "retrieved_chunks": [
+            {
+                "chunk_id": str(chunk.get("chunk_id", "")),
+                "source": str(chunk.get("source", "")),
+                "evidence_spans": _evidence_permission_spans(str(chunk.get("text", ""))),
+            }
+            for chunk in sanitized_chunks
+        ],
+        "raw_provider_answer": raw_provider_answer,
+        "normalized_answer": answer,
+        "claims": _split_permission_claims(answer),
+        "citations": citations,
+        "permission_comparisons": _permission_validation_diagnostics(associations),
+    })
     evidence_references = _validate_answer_facts(answer, citations, sanitized_chunks)
     result.update({
         "answer": answer,

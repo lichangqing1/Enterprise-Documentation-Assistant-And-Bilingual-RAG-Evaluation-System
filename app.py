@@ -27,6 +27,7 @@ from src.grounded_llm import (
     ask_grounded_llm_question,
     get_llm_provider_status,
 )
+from src.quality_reporting import build_quality_dashboard_report
 from src.text_splitter import create_chunks
 from src.retrieval import build_vector_store
 from src.rag_pipeline import SimpleRAGPipeline
@@ -283,9 +284,126 @@ with st.container(border=True):
         st.warning(f"Reindex required: {current_reindex_reason}")
 
 st.divider()
-st.subheader("Evaluation Design")
+st.subheader("Evaluation Dashboard")
 st.write(
     "This project includes automated checks for context precision, context recall, "
     "faithfulness, answer relevancy, citation accuracy, safe handling of unanswerable "
     "questions, failed-case extraction, and experiment comparison."
 )
+
+quality_report = build_quality_dashboard_report(PROJECT_PATH / "results")
+if quality_report.artifact_warnings:
+    st.warning(
+        "Some saved evaluation artifacts require attention. "
+        + " ".join(quality_report.artifact_warnings)
+    )
+
+st.markdown("### Evaluation suite overview")
+st.caption(
+    "Saved evaluation results from repository artifacts. These figures are not freshly "
+    "executed tests and do not represent live-provider requests."
+)
+suite_rows = []
+for suite in quality_report.suites:
+    suite_rows.append({
+        "Evaluation suite": suite.label,
+        "Total cases": suite.total_cases if suite.total_cases is not None else "Not available",
+        "Passed cases": suite.passed_cases if suite.passed_cases is not None else "Not available",
+        "Failed cases": suite.failed_cases if suite.failed_cases is not None else "Not available",
+        "Pass rate": (
+            f"{suite.pass_rate:.1%}" if suite.pass_rate is not None else "Not available"
+        ),
+        "Artifact status": suite.artifact_status,
+        "Saved result source": suite.source,
+    })
+st.dataframe(
+    suite_rows,
+    hide_index=True,
+    width="stretch",
+    column_config={
+        "Evaluation suite": st.column_config.TextColumn("Evaluation suite", pinned=True),
+        "Total cases": st.column_config.TextColumn("Total cases", width="small"),
+        "Passed cases": st.column_config.TextColumn("Passed cases", width="small"),
+        "Failed cases": st.column_config.TextColumn("Failed cases", width="small"),
+        "Pass rate": st.column_config.TextColumn("Pass rate", width="small"),
+        "Artifact status": st.column_config.TextColumn("Artifact status", width="small"),
+    },
+)
+
+enterprise_suite = next(
+    suite for suite in quality_report.suites if suite.key == "enterprise_safety"
+)
+enterprise_case_count = (
+    str(enterprise_suite.total_cases)
+    if enterprise_suite.total_cases is not None
+    else "unavailable"
+)
+with st.expander(f"Enterprise safety cases — {enterprise_case_count} saved cases"):
+    if enterprise_suite.cases.empty:
+        st.info(
+            "Enterprise safety case details are unavailable because the saved artifact "
+            "is missing or malformed."
+        )
+    else:
+        st.dataframe(
+            enterprise_suite.cases,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Test ID": st.column_config.TextColumn("Test ID", pinned=True),
+                "Status": st.column_config.TextColumn("Status", width="small"),
+            },
+        )
+
+st.markdown("### Quality failure categories")
+st.caption(
+    "This view reads existing result artifacts only. MAIN, CHALLENGE, and SECURITY IDs are "
+    "display IDs derived from row order because those legacy CSVs do not persist test IDs. "
+    "Enterprise ENT-SAFE IDs come directly from the safety results."
+)
+
+measured_categories = sum(
+    category.measurement_level == "Measured" for category in quality_report.categories
+)
+derived_categories = sum(
+    category.measurement_level == "Derived diagnostic" for category in quality_report.categories
+)
+unmeasured_categories = sum(
+    category.measurement_level == "Not measured" for category in quality_report.categories
+)
+with st.container(horizontal=True):
+    st.metric("Directly measured categories", measured_categories, border=True)
+    st.metric("Derived diagnostics", derived_categories, border=True)
+    st.metric("Not measured", unmeasured_categories, border=True)
+
+for category in quality_report.categories:
+    with st.expander(f"{category.label} — {category.measurement_level}"):
+        st.write(category.definition)
+        if category.measurement_level == "Measured":
+            st.success(category.measurement_note)
+        elif category.measurement_level == "Derived diagnostic":
+            st.warning(category.measurement_note)
+        else:
+            st.info(category.measurement_note)
+
+        if category.measured_cases is not None:
+            metric_columns = st.columns(2)
+            metric_columns[0].metric("Cases in saved results", category.measured_cases)
+            metric_columns[1].metric("Failed cases", category.failed_cases)
+
+        if category.cases.empty:
+            st.caption(
+                "Test IDs: not available · Expected behavior: not recorded · "
+                "Actual behavior: not measured · Status: not measured · "
+                "Failure reasons: not available"
+            )
+        else:
+            st.dataframe(
+                category.cases,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Test ID": st.column_config.TextColumn("Test ID", pinned=True),
+                    "Status": st.column_config.TextColumn("Status", width="small"),
+                },
+            )
