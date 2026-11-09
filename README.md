@@ -21,7 +21,6 @@ The project is application-level RAG engineering. Its benchmark results demonstr
 - Main, challenge, legacy security, and enterprise safety evaluation suites.
 - Streamlit evaluation dashboard with case-level expected and actual behavior.
 - FastAPI compatibility service for the historical customer-support RAG workflow.
-- Legacy `ai_testing` compatibility workflow for structured test-asset generation and diagnostic RCA.
 
 ## 3. Architecture
 
