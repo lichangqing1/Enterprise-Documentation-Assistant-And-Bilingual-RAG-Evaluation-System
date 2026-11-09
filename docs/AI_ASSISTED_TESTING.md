@@ -1,6 +1,6 @@
 # Legacy AI-Assisted Testing Compatibility
 
-> **Status:** Retained for backward compatibility. The `ai_testing` package, generated assets, FastAPI `/testing/generate` endpoint, tests, and CI step remain operational, but this workflow is not the primary Enterprise Documentation Assistant feature set.
+> **Status:** Retained for backward compatibility. The `ai_testing` package, generated assets, FastAPI `/testing/generate` endpoint, tests, and CI step remain operational, but this workflow is not part of the main Streamlit interface or the primary Enterprise Documentation Assistant feature set.
 
 This module documents the repository's historical "Using AI for Testing" capability. It turns requirements into structured, reusable testing assets that can feed the preserved RAG evaluation workflow.
 
